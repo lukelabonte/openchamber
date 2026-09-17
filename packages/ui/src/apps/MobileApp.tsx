@@ -6,6 +6,7 @@ import { MobileAppUpdateToast } from '@/components/update/MobileAppUpdateToast';
 import { ConfigUpdateOverlay } from '@/components/ui/ConfigUpdateOverlay';
 import { Button } from '@/components/ui/button';
 import { OpenChamberLogo } from '@/components/ui/OpenChamberLogo';
+import { AppStartupOverlay } from '@/components/ui/AppStartupOverlay';
 import { ChatView } from '@/components/views/ChatView';
 import { PlanView } from '@/components/views/PlanView';
 import { SettingsView } from '@/components/views/SettingsView';
@@ -28,6 +29,7 @@ import type { ProjectRef } from '@/lib/projectContextApi';
 import { readTabletLayout, useOrientation, useTabletLayout } from '@/lib/device';
 import { useHardwareKeyboard } from '@/lib/hardwareKeyboard';
 import { useI18n } from '@/lib/i18n';
+import { subscribeOpenchamberEvents } from '@/lib/openchamberEvents';
 import { runtimeFetch } from '@/lib/runtime-fetch';
 import { getRuntimeApiBaseUrl, getRuntimeKey, subscribeRuntimeEndpointChanged, switchRuntimeEndpoint, MOBILE_DISCONNECTED_RUNTIME_KEY } from '@/lib/runtime-switch';
 import { refreshGlobalSessions, resolveGlobalSessionDirectory } from '@/stores/useGlobalSessionsStore';
@@ -46,6 +48,7 @@ import {
   partitionWorktreesByRegisteredProject,
   worktreeMapsEqual,
 } from '@/lib/worktrees/worktreeManager';
+import { refreshWorktreeTopologyForChange } from '@/lib/worktrees/worktreeTopologyRefresh';
 import { useUIStore } from '@/stores/useUIStore';
 import { useUpdateStore } from '@/stores/useUpdateStore';
 import { useSessionUIStore } from '@/sync/session-ui-store';
@@ -84,8 +87,14 @@ const MOBILE_SETTINGS_PAGES = [
   'sessions',
   'git',
   'magic-prompts',
+  'snippets',
   'behavior',
+  'agents',
+  'commands',
   'mcp',
+  'plugins',
+  'skills.installed',
+  'skills.catalog',
   'providers',
   'usage',
   'voice',
@@ -296,12 +305,22 @@ const MobileShell: React.FC<{ onActiveConnectionDeleted: () => void }> = ({ onAc
     onRightEdgeSwipe: () => setWorkspaceOpen(true),
   });
 
+  // Settings owns a drill-down of its own (nav → page list → item), so the
+  // hardware back button asks it to step up before the shell closes it.
+  const settingsBackRef = React.useRef<(() => boolean) | null>(null);
+  const registerSettingsBackHandler = React.useCallback((handler: (() => boolean) | null) => {
+    settingsBackRef.current = handler;
+  }, []);
+
   // Top-most layer first: a plan or fullscreen surface can sit ABOVE a drawer
   // (opened from the drawer footer / workspace tabs), so they close before the
   // drawers underneath.
   const handleNativeBack = React.useCallback(() => {
     if (openPlan) {
       setOpenPlan(null);
+      return true;
+    }
+    if (activeSurface === 'settings' && settingsBackRef.current?.()) {
       return true;
     }
     if (activeSurface) {
@@ -590,6 +609,7 @@ const MobileShell: React.FC<{ onActiveConnectionDeleted: () => void }> = ({ onAc
                 forceMobile
                 isWindowed
                 initialMobileStage={settingsInitialMobileStage}
+                registerBackHandler={registerSettingsBackHandler}
                 // About exists for server updates — meaningful in a browser
                 // (hosted mobile), not in the Capacitor shell (store updates).
                 visiblePageSlugs={MOBILE_SETTINGS_PAGES.filter(
@@ -1098,6 +1118,22 @@ export function MobileApp({ apis }: MobileAppProps) {
     };
   }, [isConnected, projects]);
 
+  // A worktree added or removed anywhere (another window, an agent, a
+  // terminal) arrives as a server control event; refresh only the projects it
+  // names so the draft's worktree picker stays current without polling.
+  React.useEffect(() => {
+    if (!isConnected) return;
+    let cancelled = false;
+    const unsubscribe = subscribeOpenchamberEvents((event) => {
+      if (event.type !== 'worktree-changed') return;
+      void refreshWorktreeTopologyForChange(projects, event.directories, () => cancelled);
+    });
+    return () => {
+      cancelled = true;
+      unsubscribe();
+    };
+  }, [isConnected, projects]);
+
   React.useEffect(() => {
     let cancelled = false;
 
@@ -1170,8 +1206,8 @@ export function MobileApp({ apis }: MobileAppProps) {
   // already uses the real font instead of flashing the fallback and reflowing (FOUT).
   if (!fontsReady) {
     return (
-      <main className="flex min-h-dvh items-center justify-center bg-background text-foreground">
-        <OpenChamberLogo width={120} height={120} isAnimated />
+      <main className="flex min-h-dvh items-center justify-center bg-[var(--splash-background,var(--surface-background))] text-foreground">
+        <OpenChamberLogo width={120} height={120} isAnimated variant="splash" />
       </main>
     );
   }
@@ -1187,9 +1223,9 @@ export function MobileApp({ apis }: MobileAppProps) {
     // show a loader while it re-bootstraps instead of flashing the onboarding screen.
     if (hasRuntimeEndpoint) {
       return (
-        <main className="flex min-h-dvh items-center justify-center bg-background px-6 text-center text-foreground">
+        <main className="flex min-h-dvh items-center justify-center bg-[var(--splash-background,var(--surface-background))] px-6 text-center text-foreground">
           <div className="flex max-w-sm flex-col items-center gap-4">
-            <OpenChamberLogo width={120} height={120} isAnimated={!showConnectionRecovery} />
+            <OpenChamberLogo width={120} height={120} isAnimated={!showConnectionRecovery} variant="splash" />
             {showConnectionRecovery ? (
               <>
                 <div className="space-y-2">
@@ -1219,8 +1255,8 @@ export function MobileApp({ apis }: MobileAppProps) {
     // (no saved instance, unreachable, or needs re-login).
     if (autoConnectPhase !== 'done') {
       return (
-        <main className="relative flex min-h-dvh items-center justify-center bg-background text-foreground">
-          <OpenChamberLogo width={120} height={120} isAnimated />
+        <main className="relative flex min-h-dvh items-center justify-center bg-[var(--splash-background,var(--surface-background))] text-foreground">
+          <OpenChamberLogo width={120} height={120} isAnimated variant="splash" />
           {/* Absolutely positioned below the (still perfectly centered) logo so
               the text never pushes it up. 50% + half the 120px logo + a gap. */}
           {autoConnectLabel ? (
@@ -1251,8 +1287,8 @@ export function MobileApp({ apis }: MobileAppProps) {
     // only shows once the recovery delay has expired (genuinely unreachable).
     if (!showConnectionRecovery) {
       return (
-        <main className="flex min-h-dvh items-center justify-center bg-background text-foreground">
-          <OpenChamberLogo width={120} height={120} isAnimated />
+        <main className="flex min-h-dvh items-center justify-center bg-[var(--splash-background,var(--surface-background))] text-foreground">
+          <OpenChamberLogo width={120} height={120} isAnimated variant="splash" />
         </main>
       );
     }
@@ -1276,11 +1312,7 @@ export function MobileApp({ apis }: MobileAppProps) {
                   until the last-session restore decides between session and
                   draft — otherwise the auto-opened draft flashes first. The
                   shell (and sync) still mounts and warms up underneath. */}
-              {isNativeMobileApp && lastSessionRestorePending ? (
-                <div className="fixed inset-0 z-50 flex items-center justify-center bg-background">
-                  <OpenChamberLogo width={120} height={120} isAnimated />
-                </div>
-              ) : null}
+              <AppStartupOverlay ready={!isNativeMobileApp || !lastSessionRestorePending} animated />
               <SyncAppEffects embeddedBackgroundWorkEnabled={isInitialized} />
               <OpenCodeUpdateToast />
               <MobileAppUpdateToast />

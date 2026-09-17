@@ -510,12 +510,43 @@ const resolveGitInternalPath = async (repoRoot, git, gitPath) => {
   return path.resolve(repoRoot, resolved.trim());
 };
 
+const GITLINK_MODE = '160000';
+
+// Paths from `git status` can stop resolving: the file was removed after the
+// listing, or the entry is a nested repository git reports as `dir/`. Callers
+// tell these apart by `code`, and diff routes send the code to clients as is.
+const GIT_PATH_NOT_FOUND = 'path_not_found';
+const GIT_PATH_IS_NESTED_REPOSITORY = 'nested_repository';
+
+const createGitPathError = (code, filePath) => {
+  const message = code === GIT_PATH_IS_NESTED_REPOSITORY
+    ? `Path is a separate Git repository: ${filePath}`
+    : `Path not found in working tree, index, or HEAD: ${filePath}`;
+  return Object.assign(new Error(message), { code });
+};
+
+// Mode of the exact entry at `repoPath`, or null. `cat-file -e` cannot answer
+// this: a gitlink's commit lives in the submodule's object store, so git exits 1
+// without stderr, which simple-git reports as success.
+const readGitEntryMode = async (repoRoot, args, repoPath) => {
+  const result = await runGitCommand(repoRoot, args);
+  if (!result.success) return null;
+  for (const record of result.stdout.split('\0')) {
+    const tab = record.indexOf('\t');
+    if (tab !== -1 && record.slice(tab + 1) === repoPath) {
+      return record.slice(0, record.indexOf(' '));
+    }
+  }
+  return null;
+};
+
 const resolveGitFileContext = async (directoryPath, git, filePath, repoRootOverride = null) => {
   const repoRoot = repoRootOverride || await resolveGitRepositoryRoot(directoryPath, git);
   const candidates = Array.from(new Set([
     path.resolve(repoRoot, filePath),
     path.resolve(directoryPath, filePath),
   ]));
+  let nestedRepository = false;
 
   for (const absolutePath of candidates) {
     if (!isInsideOrSameDirectory(repoRoot, absolutePath)) {
@@ -526,20 +557,60 @@ const resolveGitFileContext = async (directoryPath, git, filePath, repoRootOverr
     const worktreeEntry = await fsp.lstat(absolutePath).catch(() => null);
     const isSymbolicLink = worktreeEntry?.isSymbolicLink() ?? false;
     const existsInWorktree = worktreeEntry?.isFile() || isSymbolicLink;
-    const existsInIndex = await git.raw(['cat-file', '-e', `:${repoPath}`]).then(() => true).catch(() => false);
-    const existsInHead = await git.raw(['cat-file', '-e', `HEAD:${repoPath}`]).then(() => true).catch(() => false);
+    const indexMode = await readGitEntryMode(repoRoot, ['ls-files', '--stage', '-z', '--', `:(literal)${repoPath}`], repoPath);
+    const headMode = await readGitEntryMode(repoRoot, ['ls-tree', '-z', 'HEAD', '--', repoPath], repoPath);
 
-    if (existsInWorktree || existsInIndex || existsInHead) {
+    if (existsInWorktree || indexMode || headMode) {
       return {
         absolutePath,
         repoPath,
         repoRoot,
         isSymbolicLink,
+        isSubmodule: indexMode === GITLINK_MODE || headMode === GITLINK_MODE,
       };
+    }
+
+    if (worktreeEntry?.isDirectory() && await fsp.lstat(path.join(absolutePath, '.git')).then(() => true, () => false)) {
+      nestedRepository = true;
     }
   }
 
-  throw new Error('Invalid file path');
+  throw createGitPathError(nestedRepository ? GIT_PATH_IS_NESTED_REPOSITORY : GIT_PATH_NOT_FOUND, filePath);
+};
+
+/**
+ * What a submodule entry records, since its text patch cannot show everything:
+ * with only untracked files inside, `git status` marks it modified while
+ * `git diff` prints nothing.
+ */
+const readSubmoduleState = async (repoRoot, fileContext) => {
+  const status = await runGitCommand(repoRoot, ['status', '--porcelain=v2', '-z', '--', `:(literal)${fileContext.repoPath}`]);
+  if (!status.success) {
+    throw new Error(status.message || 'Failed to read submodule status');
+  }
+  // Changed: "1 XY S<c><m><u> mH mI mW hH hI path" ("2" adds rename fields
+  // after hI). Unmerged: "u XY S<c><m><u> m1 m2 m3 mW h1 h2 h3 path", with no
+  // stage-0 index entry. A clean submodule has no record, so HEAD and the index
+  // record the same commit.
+  const record = status.stdout.split('\0').find((entry) => /^[12u] /.test(entry))?.split(' ');
+  const hasConflict = record?.[0] === 'u';
+  const readHead = async () => (await runGitCommand(repoRoot, ['rev-parse', '--verify', '--quiet', `HEAD:${fileContext.repoPath}`])).stdout.trim();
+  const head = record && !hasConflict ? record[6] : await readHead();
+  const index = hasConflict ? '' : (record ? record[7] : head);
+  const flags = record ? record[2] : 'S...';
+  // Without its own `.git`, rev-parse would answer for the parent repository.
+  const initialized = await fsp.lstat(path.join(fileContext.absolutePath, '.git')).then(() => true, () => false);
+  const worktree = initialized ? await runGitCommand(fileContext.absolutePath, ['rev-parse', '--verify', 'HEAD']) : null;
+  const commitOrNull = (value) => (value && !/^0+$/.test(value) ? value : null);
+
+  return {
+    headCommit: commitOrNull(head),
+    indexCommit: commitOrNull(index),
+    worktreeCommit: worktree?.success ? worktree.stdout.trim() : null,
+    hasTrackedChanges: flags[2] === 'M',
+    hasUntrackedFiles: flags[3] === 'U',
+    hasConflict,
+  };
 };
 
 const cleanBranchName = (branch) => {
@@ -942,7 +1013,7 @@ const runGitCommand = async (cwd, args) => {
   } catch (error) {
     return {
       success: false,
-      exitCode: typeof error?.code === 'number' ? error.code : 1,
+      exitCode: Number.isInteger(error?.code) ? error.code : null,
       stdout: String(error?.stdout || ''),
       stderr: String(error?.stderr || ''),
       message: parseGitErrorText(error),
@@ -2465,12 +2536,45 @@ export async function getStatus(directory, options = {}) {
   }
 }
 
-export async function getDiff(directory, { path: filePath, staged = false, contextLines = 3 } = {}) {
-  const { directoryPath, directoryGit, repoRoot, git } = await createRepositoryGitContext(directory);
+const getNoIndexDiff = async (repoRoot, repoPath, contextLines) => {
+  const args = ['diff', '--no-color', '--full-index'];
+  if (Number.isFinite(contextLines)) {
+    args.push(`-U${Math.max(0, contextLines)}`);
+  }
+  args.push('--no-index', '--', '/dev/null', repoPath);
+  const result = await runGitCommand(repoRoot, args);
+  // Exit 1 means differences, even when Git also writes warnings to stderr.
+  // Spawn and buffer errors have no numeric exit code and must still fail.
+  if (result.exitCode === 0 || result.exitCode === 1) {
+    return result.stdout;
+  }
+  throw new Error(result.stderr || result.message || 'Failed to get untracked Git diff');
+};
 
+export async function getDiff(directory, { path: filePath, staged = false, contextLines = 3 } = {}) {
+  const context = await createRepositoryGitContext(directory);
+  const fileContext = filePath
+    ? await resolveGitFileContext(context.directoryPath, context.directoryGit, filePath, context.repoRoot)
+    : null;
+  return readDiff(context, fileContext, { staged, contextLines });
+}
+
+/**
+ * `getDiff` for one path, plus what a submodule records. A submodule patch is
+ * empty when only untracked files changed inside it, so callers need the state
+ * to show anything truthful.
+ */
+export async function getPathDiff(directory, { path: filePath, staged = false, contextLines = 3 } = {}) {
+  const context = await createRepositoryGitContext(directory);
+  const fileContext = await resolveGitFileContext(context.directoryPath, context.directoryGit, filePath, context.repoRoot);
+  const diff = await readDiff(context, fileContext, { staged, contextLines });
+  if (!fileContext.isSubmodule) return { diff, submodule: null };
+  return { diff, submodule: await readSubmoduleState(context.repoRoot, fileContext) };
+}
+
+async function readDiff({ repoRoot, git }, fileContext, { staged, contextLines }) {
   try {
-    const args = ['diff', '--no-color'];
-    const fileContext = filePath ? await resolveGitFileContext(directoryPath, directoryGit, filePath, repoRoot) : null;
+    const args = ['diff', '--no-color', '--full-index'];
 
     if (typeof contextLines === 'number' && !Number.isNaN(contextLines)) {
       args.push(`-U${Math.max(0, contextLines)}`);
@@ -2515,21 +2619,7 @@ export async function getDiff(directory, { path: filePath, staged = false, conte
         ].join('\n');
       }
 
-      const noIndexArgs = ['diff', '--no-color'];
-      if (typeof contextLines === 'number' && !Number.isNaN(contextLines)) {
-        noIndexArgs.push(`-U${Math.max(0, contextLines)}`);
-      }
-      noIndexArgs.push('--no-index', '--', '/dev/null', fileContext.repoPath);
-      try {
-        const noIndexDiff = await git.raw(noIndexArgs);
-        return noIndexDiff;
-      } catch (noIndexError) {
-        // git diff --no-index returns exit code 1 when differences exist (not a real error)
-        if (noIndexError.exitCode === 1 && noIndexError.message) {
-          return noIndexError.message;
-        }
-        throw noIndexError;
-      }
+      return await getNoIndexDiff(repoRoot, fileContext.repoPath, contextLines);
     }
   } catch (error) {
     console.error('Failed to get Git diff:', error);
@@ -2578,7 +2668,7 @@ export async function getUntrackedDiffs(directory, filePaths = [], { concurrency
   const paths = (Array.isArray(filePaths) ? filePaths : []).filter((value) => typeof value === 'string' && value);
   if (paths.length === 0) return [];
 
-  const { directoryPath, directoryGit, repoRoot, git } = await createRepositoryGitContext(directory);
+  const { directoryPath, directoryGit, repoRoot } = await createRepositoryGitContext(directory);
   const results = new Array(paths.length).fill('');
   let cursor = 0;
 
@@ -2587,18 +2677,7 @@ export async function getUntrackedDiffs(directory, filePaths = [], { concurrency
       const index = cursor++;
       try {
         const fileContext = await resolveGitFileContext(directoryPath, directoryGit, paths[index], repoRoot);
-        const args = ['diff', '--no-color'];
-        if (typeof contextLines === 'number' && !Number.isNaN(contextLines)) {
-          args.push(`-U${Math.max(0, contextLines)}`);
-        }
-        args.push('--no-index', '--', '/dev/null', fileContext.repoPath);
-        try {
-          results[index] = await git.raw(args);
-        } catch (error) {
-          // `git diff --no-index` exits 1 whenever there are differences, which
-          // for a new file is always.
-          results[index] = error?.exitCode === 1 && error?.message ? error.message : '';
-        }
+        results[index] = await getNoIndexDiff(repoRoot, fileContext.repoPath, contextLines);
       } catch {
         results[index] = '';
       }
@@ -2628,7 +2707,51 @@ async function assertRangeRefsResolve(git, refs) {
   }
 }
 
-export async function getRangeDiff(directory, { base, head, path: filePath, contextLines = 3 } = {}) {
+// A private index lets git include untracked paths in the same tree comparison
+// as tracked files, including a staged deletion recreated at the same path.
+// Intent-to-add records only their existence; diff reads current file contents.
+async function runWorkingTreeRangeDiff(context, baseRef, headRef, args, paths = []) {
+  const { git, repoRoot } = context;
+  const readHead = async () => {
+    const commit = (await git.raw(['rev-parse', '--verify', 'HEAD'])).trim();
+    const ref = (await git.raw(['symbolic-ref', '--quiet', 'HEAD'])).trim();
+    return `${commit}\n${ref}`;
+  };
+  const startingHead = await readHead();
+  const [headCommit, currentRef] = startingHead.split('\n');
+  const requestedRef = (await git.raw(['rev-parse', '--verify', '--symbolic-full-name', '--end-of-options', headRef])).trim();
+  if (requestedRef !== currentRef) {
+    throw new Error('Working-tree comparisons require the checked-out branch. Refresh and try again.');
+  }
+  const mergeBase = (await git.raw(['merge-base', baseRef, headCommit])).trim();
+  const readDiff = async (comparisonGit) => {
+    const diff = await comparisonGit.raw([...args, mergeBase, '--', ...paths]);
+    if (await readHead() !== startingHead) {
+      throw new Error('The checked-out branch changed during comparison. Refresh and try again.');
+    }
+    return diff;
+  };
+  const untracked = await git.raw(['ls-files', '--others', '--exclude-standard', '-z', '--', ...paths]);
+  if (!untracked) return readDiff(git);
+
+  const temporaryDirectory = await fsp.mkdtemp(path.join(os.tmpdir(), 'openchamber-branch-diff-'));
+  try {
+    const indexPath = (await git.raw(['rev-parse', '--git-path', 'index'])).trim();
+    const temporaryIndex = path.join(temporaryDirectory, 'index');
+    await fsp.copyFile(path.resolve(repoRoot, indexPath), temporaryIndex);
+    const pathspecFile = path.join(temporaryDirectory, 'paths');
+    await fsp.writeFile(pathspecFile, untracked);
+    const comparisonGit = await createGit(repoRoot);
+    comparisonGit.env('GIT_INDEX_FILE', temporaryIndex);
+    comparisonGit.env('GIT_LITERAL_PATHSPECS', '1');
+    await comparisonGit.raw(['add', '--intent-to-add', '--pathspec-from-file=' + pathspecFile, '--pathspec-file-nul']);
+    return await readDiff(comparisonGit);
+  } finally {
+    await fsp.rm(temporaryDirectory, { recursive: true, force: true });
+  }
+}
+
+export async function getRangeDiff(directory, { base, head, path: filePath, contextLines = 3, includeWorkingTree = false } = {}) {
   const { directoryPath, directoryGit, repoRoot, git } = await createRepositoryGitContext(directory);
   const baseRef = typeof base === 'string' ? base.trim() : '';
   const headRef = typeof head === 'string' ? head.trim() : '';
@@ -2636,51 +2759,39 @@ export async function getRangeDiff(directory, { base, head, path: filePath, cont
     throw new Error('base and head are required');
   }
 
-  // Prefer remote-tracking base ref so merged commits don't reappear
-  // when local base branch is stale (common when user stays on feature branch).
-  let resolvedBase = baseRef;
-  const originCandidate = `refs/remotes/origin/${baseRef}`;
-  try {
-    const verified = await git.raw(['rev-parse', '--verify', originCandidate]);
-    if (verified && verified.trim()) {
-      resolvedBase = `origin/${baseRef}`;
-    }
-  } catch {
-    // ignore
-  }
-
-  // Not every repository has an `origin`. When the base names a branch that
-  // exists only on another remote, a bare name does not resolve — git looks in
-  // refs/heads, not across remotes — and the diff fails with "ambiguous
-  // argument". Fall back to whichever remote actually carries it.
-  if (resolvedBase === baseRef && !/[*?[\]^~:\\]/.test(baseRef)) {
-    const resolvesLocally = await git
-      .raw(['rev-parse', '--verify', `refs/heads/${baseRef}`])
-      .then((value) => Boolean(String(value || '').trim()))
-      .catch(() => false);
-
-    if (!resolvesLocally) {
-      const remoteMatch = await git
-        .raw(['for-each-ref', '--count=1', '--format=%(refname:short)', `refs/remotes/*/${baseRef}`])
-        .then((value) => String(value || '').trim())
-        .catch(() => '');
-      if (remoteMatch) {
-        resolvedBase = remoteMatch;
-      }
-    }
-  }
-
-  await assertRangeRefsResolve(git, [resolvedBase, headRef]);
+  await assertRangeRefsResolve(git, [baseRef, headRef]);
 
   const args = ['diff', '--no-color'];
   if (typeof contextLines === 'number' && !Number.isNaN(contextLines)) {
     args.push(`-U${Math.max(0, contextLines)}`);
   }
-  args.push(`${resolvedBase}...${headRef}`);
+  const paths = [];
   if (filePath) {
-    const fileContext = await resolveGitFileContext(directoryPath, directoryGit, filePath, repoRoot);
-    args.push('--', fileContext.repoPath);
+    try {
+      const fileContext = await resolveGitFileContext(directoryPath, directoryGit, filePath, repoRoot);
+      paths.push(fileContext.repoPath);
+    } catch (error) {
+      if (error.code !== GIT_PATH_NOT_FOUND) throw error;
+      // A committed deletion is absent from HEAD, the index, and the working
+      // tree. It is still a valid range path when it exists at the merge base.
+      const mergeBase = (await git.raw(['merge-base', baseRef, headRef])).trim();
+      for (const root of new Set([repoRoot, directoryPath])) {
+        const target = path.resolve(root, filePath);
+        if (!isInsideOrSameDirectory(repoRoot, target)) continue;
+        const repoPath = toGitPath(path.relative(repoRoot, target));
+        const exists = await git.raw(['cat-file', '-e', `${mergeBase}:${repoPath}`]).then(() => true).catch(() => false);
+        if (exists) {
+          paths.push(repoPath);
+          break;
+        }
+      }
+      if (paths.length === 0) throw error;
+    }
   }
+  if (includeWorkingTree) {
+    return runWorkingTreeRangeDiff({ git, repoRoot }, baseRef, headRef, args, paths);
+  }
+  args.push(`${baseRef}...${headRef}`, '--', ...paths);
   const diff = await git.raw(args);
   return diff;
 }
@@ -2702,6 +2813,9 @@ export function parseBranchCreationSource(reflogText) {
     .split('\n')
     .map((line) => line.trim())
     .filter(Boolean);
+  // Rebase records its destination as a commit, not a parent branch. The
+  // creation ref is no longer evidence of the current base after restacking.
+  if (lines.some((line) => /^rebase(?:\s|\()/.test(line))) return null;
   // Reflog lists newest entries first; the creation entry is the oldest one.
   for (let index = lines.length - 1; index >= 0; index -= 1) {
     const match = lines[index].match(BRANCH_CREATION_SOURCE_RE);
@@ -2753,31 +2867,23 @@ export async function getBranchBase(directory, branch) {
   return { base: source };
 }
 
-export async function getRangeFiles(directory, { base, head } = {}) {
-  const { git } = await createRepositoryGitContext(directory);
+export async function getRangeFiles(directory, { base, head, includeWorkingTree = false } = {}) {
+  const { git, repoRoot } = await createRepositoryGitContext(directory);
   const baseRef = typeof base === 'string' ? base.trim() : '';
   const headRef = typeof head === 'string' ? head.trim() : '';
   if (!baseRef || !headRef) {
     throw new Error('base and head are required');
   }
 
-  let resolvedBase = baseRef;
-  const originCandidate = `refs/remotes/origin/${baseRef}`;
-  try {
-    const verified = await git.raw(['rev-parse', '--verify', originCandidate]);
-    if (verified && verified.trim()) {
-      resolvedBase = `origin/${baseRef}`;
-    }
-  } catch {
-    // ignore
-  }
-
-  await assertRangeRefsResolve(git, [resolvedBase, headRef]);
+  await assertRangeRefsResolve(git, [baseRef, headRef]);
 
   // `-C` (copy detection among changed files only, so cheap) makes copies
   // surface as C entries instead of plain additions; rename detection is on
   // by default.
-  const raw = await git.raw(['diff', '--name-status', '-z', '-C', `${resolvedBase}...${headRef}`]);
+  const args = ['diff', '--name-status', '-z', '-C'];
+  const raw = includeWorkingTree
+    ? await runWorkingTreeRangeDiff({ git, repoRoot }, baseRef, headRef, args)
+    : await git.raw([...args, `${baseRef}...${headRef}`, '--']);
   // -z format: STATUS\0PATH\0[ORIG\0] repeated. For rename/copy entries
   // (`R100`, `C75`) the first path token is the ORIGINAL path and the second
   // is the DESTINATION — the diff (and the UI) must address the destination.
@@ -2787,7 +2893,7 @@ export async function getRangeFiles(directory, { base, head } = {}) {
     const status = (tokens[index] || '').trim();
     if (!status) continue;
     const isRenameOrCopy = status.startsWith('R') || status.startsWith('C');
-    const path = isRenameOrCopy ? (tokens[index + 2] || '').trim() : (tokens[index + 1] || '').trim();
+    const path = isRenameOrCopy ? (tokens[index + 2] || '') : (tokens[index + 1] || '');
     index += isRenameOrCopy ? 2 : 1;
     if (path) {
       files.push({ path, status: status.charAt(0) });
@@ -2831,27 +2937,6 @@ const parseIsBinaryFromNumstat = (raw) => {
   const firstLine = text.split('\n').map((line) => line.trim()).find(Boolean) || '';
   const [added, deleted] = firstLine.split('\t');
   return added === '-' || deleted === '-';
-};
-
-const extractGitStatusPath = (status, pathPart) => {
-  if ((status === 'R' || status === 'C') && pathPart.includes('\t')) {
-    return pathPart.split('\t').pop() || pathPart;
-  }
-  return pathPart;
-};
-
-const extractGitNumstatDestinationPath = (filePath) => {
-  if (!filePath.includes(' => ')) {
-    return filePath;
-  }
-
-  const braceMatch = filePath.match(/^(.*)\{([^{}]*)\s=>\s([^{}]*)\}(.*)$/);
-  if (braceMatch) {
-    const [, prefix, , destination, suffix] = braceMatch;
-    return `${prefix}${destination}${suffix}`.replace(/\/+/g, '/');
-  }
-
-  return filePath.split(' => ').pop()?.trim() || filePath;
 };
 
 const looksBinaryBySniff = async (absolutePath) => {
@@ -2911,7 +2996,22 @@ export async function getFileDiff(directory, { path: filePath, staged = false } 
   const { directoryPath, directoryGit, repoRoot, git } = await createRepositoryGitContext(directory);
   const isImage = isImageFile(filePath);
   const mimeType = isImage ? getImageMimeType(filePath) : null;
-  const { absolutePath, repoPath, isSymbolicLink } = await resolveGitFileContext(directoryPath, directoryGit, filePath, repoRoot);
+  const fileContext = await resolveGitFileContext(directoryPath, directoryGit, filePath, repoRoot);
+  const { absolutePath, repoPath, isSymbolicLink } = fileContext;
+
+  if (fileContext.isSubmodule) {
+    // Git's own text form of a gitlink, so a plain two-pane view still shows
+    // the recorded commits; `submodule` carries what the text cannot.
+    const submodule = await readSubmoduleState(repoRoot, fileContext);
+    const describeCommit = (commit) => (commit ? `Subproject commit ${commit}\n` : '');
+    return {
+      original: describeCommit(submodule.headCommit),
+      modified: describeCommit(staged ? submodule.indexCommit : submodule.worktreeCommit),
+      path: filePath,
+      isBinary: false,
+      submodule,
+    };
+  }
 
   if (!isImage && !isSymbolicLink) {
     const isBinaryBySniff = await looksBinaryBySniff(absolutePath);
@@ -3103,11 +3203,13 @@ const normalizePatchTargetPath = (value) => {
 };
 
 const extractPatchTargetPath = (patch) => {
-  const matches = [...patch.matchAll(/^(?:-{3}|\+{3})\s+.+$/gm)];
+  const firstHunk = patch.search(/^@@\s/m);
+  const header = firstHunk < 0 ? patch : patch.slice(0, firstHunk);
+  const matches = [...header.matchAll(/^(?:-{3}|\+{3})\s+.+$/gm)];
   const realTargets = matches
     .map((match) => normalizePatchTargetPath(parsePatchPathToken(match[0])))
     .filter(Boolean);
-  return realTargets[0] || null;
+  return realTargets.at(-1) || null;
 };
 
 const writeTempPatchFile = async (patch) => {
@@ -3135,9 +3237,21 @@ export async function applyHunk(directory, filePath, options = {}) {
     const fileContext = await resolveGitFileContext(directoryPath, directoryGit, filePath, repoRoot);
     validateRepositoryFilePaths(repoRoot, [fileContext.repoPath]);
 
-    const targetPath = extractPatchTargetPath(patch);
-    if (targetPath && targetPath !== fileContext.repoPath && targetPath !== filePath) {
-      throw new Error('patch target path does not match the requested file');
+    // Applicability alone is insufficient: a previously staged or committed
+    // hunk may still reverse cleanly against the working tree. Accept only a
+    // canonical hunk from this file's current working/index diff.
+    const current = await getDiff(directory, { path: filePath, staged: action === 'unstage', contextLines: 3 });
+    const starts = [...current.matchAll(/^@@\s/gm)].map((match) => match.index);
+    const header = current.slice(0, starts[0] ?? 0);
+    const isCurrentHunk = starts.some((start, index) => (
+      header + current.slice(start, starts[index + 1] ?? current.length) === patch
+    ));
+    if (!isCurrentHunk) {
+      const targetPath = extractPatchTargetPath(patch);
+      if (targetPath && targetPath !== fileContext.repoPath && targetPath !== filePath) {
+        throw new Error('patch target path does not match the requested file');
+      }
+      throw new Error('Hunk no longer applies — refresh and try again.');
     }
 
     const flags = HUNK_ACTION_FLAGS[action];
@@ -4054,13 +4168,166 @@ export async function getWorktrees(directory) {
     // OpenCode's working directory or an unconfigured project path), git
     // exits with "fatal: not a git repository ...". Treat that as an
     // authoritative empty result so the route handler can still respond
-    // 200 [] and the desktop main.log stays free of noise.
-    if (!isNotGitRepositoryError(error)) {
-      console.warn('Failed to list worktrees, returning empty list:', error?.message || error);
-    }
-    return [];
+    // 200 [] and the desktop main.log stays free of noise. Any other failure
+    // is a failure: callers keep their last known topology instead of
+    // treating "git could not answer" as "there are no worktrees".
+    if (isNotGitRepositoryError(error)) return [];
+    throw error;
   }
 }
+
+// ---------------------------------------------------------------------------
+// Worktree topology change tracking
+//
+// Linked worktrees are registered under the repository's common Git directory
+// (`<common>/worktrees/<name>`). Instead of watching the filesystem, the server
+// fingerprints that directory while handling requests clients already make
+// (status, worktree listing) and after its own worktree create/remove, and
+// tells connected clients when the set of worktrees changed. Cost scales with
+// user activity, never with the number of registered projects.
+// ---------------------------------------------------------------------------
+
+const MAX_TRACKED_WORKTREE_DIRECTORIES = 500;
+const MAX_TRACKED_WORKTREE_REPOSITORIES = 200;
+const MAX_DIRECTORIES_PER_WORKTREE_REPOSITORY = 100;
+const worktreeTopologyListeners = new Set();
+const worktreeRepositoryKeyByDirectory = new Map();
+const worktreeTopologyByRepository = new Map();
+
+export function subscribeWorktreeTopologyChanges(listener) {
+  worktreeTopologyListeners.add(listener);
+  return () => {
+    worktreeTopologyListeners.delete(listener);
+  };
+}
+
+const rememberWorktreeRepositoryKey = (directoryPath, key) => {
+  worktreeRepositoryKeyByDirectory.delete(directoryPath);
+  worktreeRepositoryKeyByDirectory.set(directoryPath, key);
+  while (worktreeRepositoryKeyByDirectory.size > MAX_TRACKED_WORKTREE_DIRECTORIES) {
+    const oldest = worktreeRepositoryKeyByDirectory.keys().next().value;
+    if (oldest === undefined) break;
+    worktreeRepositoryKeyByDirectory.delete(oldest);
+  }
+};
+
+/**
+ * Canonical common Git directory for `directoryPath`, resolved with git once per
+ * directory and cached. Returns null when git cannot answer (not a repository,
+ * missing directory).
+ */
+const resolveWorktreeRepositoryKey = async (directoryPath) => {
+  const cached = worktreeRepositoryKeyByDirectory.get(directoryPath);
+  if (cached) {
+    rememberWorktreeRepositoryKey(directoryPath, cached);
+    return cached;
+  }
+  const result = await runGitCommand(directoryPath, ['rev-parse', '--git-common-dir']);
+  const rawCommonDir = String(result.stdout || '').trim();
+  if (!result.success || !rawCommonDir) {
+    return null;
+  }
+  const commonDir = path.resolve(directoryPath, rawCommonDir);
+  let key = commonDir;
+  try {
+    key = fs.realpathSync(commonDir);
+  } catch {
+    // Keep the resolved path; a missing common dir cannot register worktrees.
+  }
+  rememberWorktreeRepositoryKey(directoryPath, key);
+  return key;
+};
+
+/**
+ * Cheap identity of the registered linked-worktree set: the `worktrees`
+ * directory's mtime plus its entry names. Adding, removing, or pruning a
+ * worktree changes at least one of them; `git worktree move` rewrites files
+ * inside an entry and is not detected.
+ */
+const readWorktreeTopologyFingerprint = (repositoryKey) => {
+  const worktreesDir = path.join(repositoryKey, 'worktrees');
+  try {
+    const stat = fs.statSync(worktreesDir);
+    const names = fs.readdirSync(worktreesDir).sort();
+    return `${stat.mtimeMs}:${names.join('\0')}`;
+  } catch {
+    return 'none';
+  }
+};
+
+const trackWorktreeTopologyDirectory = (repositoryKey, directoryPath) => {
+  let entry = worktreeTopologyByRepository.get(repositoryKey);
+  if (!entry) {
+    entry = { directories: new Set(), fingerprint: null };
+  }
+  // Re-insert so the map stays ordered by last use; the least recently used
+  // repository is dropped first once the bound is reached.
+  worktreeTopologyByRepository.delete(repositoryKey);
+  worktreeTopologyByRepository.set(repositoryKey, entry);
+  while (worktreeTopologyByRepository.size > MAX_TRACKED_WORKTREE_REPOSITORIES) {
+    const oldest = worktreeTopologyByRepository.keys().next().value;
+    if (oldest === undefined) break;
+    worktreeTopologyByRepository.delete(oldest);
+  }
+  if (entry.directories.size < MAX_DIRECTORIES_PER_WORKTREE_REPOSITORY) {
+    entry.directories.add(directoryPath);
+  }
+  return entry;
+};
+
+const notifyWorktreeTopologyChanged = (entry) => {
+  const event = { directories: [...entry.directories], at: Date.now() };
+  for (const listener of worktreeTopologyListeners) {
+    try {
+      listener(event);
+    } catch (error) {
+      console.warn('Worktree topology listener failed:', error?.message || error);
+    }
+  }
+};
+
+/**
+ * Compare the repository's worktree set with the last one seen for it and
+ * notify listeners when it changed. The first observation only records a
+ * baseline. Called from request handlers that already touch the repository;
+ * never throws.
+ */
+export async function observeWorktreeTopology(directory) {
+  const directoryPath = normalizeDirectoryPath(directory);
+  if (!directoryPath) return;
+  try {
+    const repositoryKey = await resolveWorktreeRepositoryKey(directoryPath);
+    if (!repositoryKey) return;
+    const entry = trackWorktreeTopologyDirectory(repositoryKey, directoryPath);
+    const fingerprint = readWorktreeTopologyFingerprint(repositoryKey);
+    if (entry.fingerprint === fingerprint) return;
+    const hadBaseline = entry.fingerprint !== null;
+    entry.fingerprint = fingerprint;
+    if (hadBaseline) notifyWorktreeTopologyChanged(entry);
+  } catch (error) {
+    console.warn('Failed to observe worktree topology:', error?.message || error);
+  }
+}
+
+/**
+ * Record that this server changed the repository's worktree set itself and
+ * notify listeners right away. `directory` is any directory inside the
+ * repository; never throws so a notification problem cannot fail the
+ * operation that triggered it.
+ */
+const publishWorktreeTopologyChange = async (directory) => {
+  const directoryPath = normalizeDirectoryPath(directory);
+  if (!directoryPath) return;
+  try {
+    const repositoryKey = await resolveWorktreeRepositoryKey(directoryPath);
+    if (!repositoryKey) return;
+    const entry = trackWorktreeTopologyDirectory(repositoryKey, directoryPath);
+    entry.fingerprint = readWorktreeTopologyFingerprint(repositoryKey);
+    notifyWorktreeTopologyChanged(entry);
+  } catch (error) {
+    console.warn('Failed to publish worktree topology change:', error?.message || error);
+  }
+};
 
 export async function validateWorktreeCreate(directory, input = {}) {
   const mode = input?.mode === 'existing' ? 'existing' : 'new';
@@ -4319,6 +4586,7 @@ async function attachGitWorktreeToCandidate(context, candidate, input = {}) {
   }
 
   await runGitCommandOrThrow(context.primaryWorktree, worktreeAddArgs, 'Failed to create git worktree');
+  await publishWorktreeTopologyChange(context.primaryWorktree);
 
   const upstreamRemote = shouldSetUpstream
     ? String(input?.upstreamRemote || inferredUpstream?.remote || '').trim()
@@ -4541,6 +4809,7 @@ export async function removeWorktree(directory, input = {}) {
     ['worktree', 'remove', '--force', matchedEntry.worktree],
     'Failed to remove git worktree'
   );
+  await publishWorktreeTopologyChange(context.primaryWorktree);
 
   if (deleteLocalBranch) {
     const branchName = cleanBranchName(String(matchedEntry.branchRef || matchedEntry.branch || '').trim());
@@ -4679,12 +4948,11 @@ export async function getLog(directory, options = {}) {
     };
     const resolvedFrom = await resolveBaseRefForLog(options.from, checkRef);
 
-    const baseLog = await git.log({
-      maxCount,
-      from: resolvedFrom,
-      to: options.to,
-      file: filePath
-    });
+    // simple-git's `to` alone means HEAD..to, which is empty for the current
+    // branch. A single requested ref means its reachable history instead.
+    const baseLog = options.to && !resolvedFrom
+      ? await git.log([`--max-count=${maxCount}`, options.to, ...(filePath ? ['--', filePath] : [])])
+      : await git.log({ maxCount, from: resolvedFrom, to: options.to, file: filePath });
 
     const logArgs = [
       'log',
@@ -4928,85 +5196,61 @@ export async function canonicalizeWorktreeState(directory) {
   };
 }
 
+async function resolveCommitHash(git, hash) {
+  if (!/^[0-9a-f]{7,64}$/i.test(hash)) throw new Error('A commit hash is required');
+  return (await git.raw(['rev-parse', '--verify', '--end-of-options', `${hash}^{commit}`])).trim();
+}
+
+const commitShowArgs = (hash) => ['show', '--format=', '--root', '--diff-merges=first-parent', '--find-renames', hash];
+
+export async function getCommitDiff(directory, { hash, path: filePath, previousPath, contextLines = 3 } = {}) {
+  const { git } = await createRepositoryGitContext(directory);
+  const commit = await resolveCommitHash(git, hash);
+  const paths = [filePath, previousPath].filter(Boolean).map((value) => `:(literal)${value}`);
+  return git.raw([
+    ...commitShowArgs(commit), '--no-color', '--no-ext-diff', `-U${Math.max(0, contextLines)}`,
+    '--', ...paths,
+  ]);
+}
+
 export async function getCommitFiles(directory, commitHash) {
   const { git } = await createRepositoryGitContext(directory);
-
-  try {
-
-    const numstatRaw = await git.raw([
-      'show',
-      '--numstat',
-      '--format=',
-      commitHash
-    ]);
-
-    const files = [];
-    const lines = numstatRaw.trim().split('\n').filter(Boolean);
-
-    for (const line of lines) {
-      const parts = line.split('\t');
-      if (parts.length < 3) continue;
-
-      const [insertionsRaw, deletionsRaw, ...pathParts] = parts;
-      const filePath = pathParts.join('\t');
-      if (!filePath) continue;
-
-      const insertions = insertionsRaw === '-' ? 0 : parseInt(insertionsRaw, 10) || 0;
-      const deletions = deletionsRaw === '-' ? 0 : parseInt(deletionsRaw, 10) || 0;
-      const isBinary = insertionsRaw === '-' && deletionsRaw === '-';
-
-      let changeType = 'M';
-      let displayPath = filePath;
-
-      if (filePath.includes(' => ')) {
-        changeType = 'R';
-
-        const match = filePath.match(/(?:\{[^}]*\s=>\s[^}]*\}|.*\s=>\s.*)/);
-        if (match) {
-          displayPath = filePath;
-        }
-      }
-
-      files.push({
-        path: displayPath,
-        insertions,
-        deletions,
-        isBinary,
-        changeType
-      });
+  const hash = await resolveCommitHash(git, commitHash);
+  const [numstat, nameStatus] = await Promise.all([
+    git.raw([...commitShowArgs(hash), '--numstat', '-z', '--']),
+    git.raw([...commitShowArgs(hash), '--name-status', '-z', '--']),
+  ]);
+  const stats = new Map();
+  const tokens = numstat.split('\0');
+  for (let index = 0; index < tokens.length; index += 1) {
+    const match = /^(\d+|-)\t(\d+|-)\t([\s\S]*)$/.exec(tokens[index]);
+    if (!match) continue;
+    let destination = match[3];
+    if (!destination) {
+      destination = tokens[index + 2];
+      index += 2;
     }
-
-    const nameStatusRaw = await git.raw([
-      'show',
-      '--name-status',
-      '--format=',
-      commitHash
-    ]).catch(() => '');
-
-    const statusMap = new Map();
-    const statusLines = nameStatusRaw.trim().split('\n').filter(Boolean);
-    for (const line of statusLines) {
-      const match = line.match(/^([AMDRC])\d*\t(.+)$/);
-      if (match) {
-        const [, status, pathPart] = match;
-        statusMap.set(extractGitStatusPath(status, pathPart), status);
-      }
-    }
-
-    for (const file of files) {
-      const basePath = extractGitNumstatDestinationPath(file.path);
-
-      const status = statusMap.get(basePath) || statusMap.get(file.path);
-      if (status) {
-        file.changeType = status;
-      }
-    }
-
-    return { files };
-  } catch (error) {
-    console.error('Failed to get commit files:', error);
-    throw error;
+    stats.set(destination, {
+      insertions: Number.parseInt(match[1], 10) || 0,
+      deletions: Number.parseInt(match[2], 10) || 0,
+      isBinary: match[1] === '-',
+    });
   }
+  const files = [];
+  const names = nameStatus.split('\0');
+  for (let index = 0; index < names.length; index += 1) {
+    const changeType = names[index].charAt(0);
+    if (!changeType) continue;
+    const renamed = changeType === 'R' || changeType === 'C';
+    const previousPath = renamed ? names[++index] : undefined;
+    const filePath = names[++index];
+    const fileStats = stats.get(filePath);
+    if (!filePath || !fileStats) throw new Error('Incomplete commit file statistics');
+    const entry = { path: filePath, ...fileStats, changeType };
+    if (previousPath) entry.previousPath = previousPath;
+    files.push(entry);
+  }
+  return { files };
 }
 
 export async function renameBranch(directory, oldName, newName) {

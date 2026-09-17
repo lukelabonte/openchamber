@@ -6,6 +6,8 @@ import type {
   GitBranch,
   GitLogResponse,
   GitIdentitySummary,
+  GitFileDiffResponse,
+  GitSubmoduleState,
 } from '@/lib/api/types';
 import { getDeferredSafeStorage } from '@/stores/utils/safeStorage';
 import { getRuntimeKey } from '@/lib/runtime-switch';
@@ -36,13 +38,21 @@ type GitStatusRequestOptions = { mode?: 'light'; fresh?: boolean };
 // scan (`null`), or a runtime without the discovery route (`'unsupported'`).
 export type NestedRepoDiscovery = string[] | null | 'unsupported';
 
+/** Two-sided file contents; `submodule` is set when the path is a submodule, whose contents are only commit lines. */
+type CachedGitDiff = {
+  original: string;
+  modified: string;
+  isBinary?: boolean;
+  submodule: GitSubmoduleState | null;
+};
+
 interface DirectoryGitState {
   isGitRepo: boolean | null;
   status: GitStatus | null;
   branches: GitBranch | null;
   log: GitLogResponse | null;
   identity: GitIdentitySummary | null;
-  diffCache: Map<string, { original: string; modified: string; fetchedAt: number; isBinary?: boolean }>;
+  diffCache: Map<string, CachedGitDiff & { fetchedAt: number }>;
   indexRevision: number;
   lastRepoCheckAt: number;
   lastStatusFetch: number;
@@ -78,8 +88,8 @@ interface GitStore {
   restoreStatus: (directory: string, status: GitStatus | null) => void;
   bumpIndexRevision: (directory: string) => void;
 
-  getDiff: (directory: string, filePath: string) => { original: string; modified: string; fetchedAt: number; isBinary?: boolean } | null;
-  setDiff: (directory: string, filePath: string, diff: { original: string; modified: string; isBinary?: boolean }, expectedRuntimeKey?: string) => void;
+  getDiff: (directory: string, filePath: string) => CachedGitDiff & { fetchedAt: number } | null;
+  setDiff: (directory: string, filePath: string, diff: CachedGitDiff, expectedRuntimeKey?: string) => void;
   clearDiffCache: (directory: string, filePaths?: string[]) => void;
   fetchAllDiffs: (directory: string, git: GitAPI) => Promise<void>;
   prefetchDiffs: (directory: string, git: GitAPI, filePaths: string[], options?: { maxFiles?: number }) => Promise<void>;
@@ -108,12 +118,6 @@ interface GitStore {
   resetForRuntimeSwitch: (runtimeKey: string) => void;
 }
 
-interface GitFileDiffResponse {
-  original: string;
-  modified: string;
-  path: string;
-  isBinary?: boolean;
-}
 
 interface GitAPI {
   checkIsGitRepository: (directory: string) => Promise<boolean>;
@@ -374,10 +378,10 @@ const seedNestedRepoSelection = (runtimeKey: string): Map<string, string> => {
 
 // LRU eviction helper for diff cache
 const evictDiffCacheIfNeeded = (
-  diffCache: Map<string, { original: string; modified: string; fetchedAt: number; isBinary?: boolean }>,
+  diffCache: Map<string, CachedGitDiff & { fetchedAt: number }>,
   maxEntries: number = DIFF_CACHE_MAX_ENTRIES,
   maxTotalSize: number = DIFF_CACHE_MAX_TOTAL_SIZE_BYTES
-): Map<string, { original: string; modified: string; fetchedAt: number; isBinary?: boolean }> => {
+): Map<string, CachedGitDiff & { fetchedAt: number }> => {
   // Calculate total size
   let totalSize = 0;
   for (const entry of diffCache.values()) {
@@ -394,7 +398,7 @@ const evictDiffCacheIfNeeded = (
   const entries = Array.from(diffCache.entries())
     .sort((a, b) => a[1].fetchedAt - b[1].fetchedAt);
 
-  const newCache = new Map<string, { original: string; modified: string; fetchedAt: number; isBinary?: boolean }>();
+  const newCache = new Map<string, CachedGitDiff & { fetchedAt: number }>();
   let newTotalSize = 0;
 
   // Keep entries from newest to oldest until limits are reached
@@ -657,7 +661,11 @@ export const useGitStore = create<GitStore>()(
         inFlightStatusFetches.clear();
         inFlightEnsureAllByDirectory.clear();
         inFlightNestedRepoDiscovery.clear();
-        inFlightDiffFetchesByDirectory.clear();
+        // Outstanding transports still consume capacity on their captured
+        // runtime, even after its visible cache has been reset.
+        for (const [key, requests] of inFlightDiffFetchesByDirectory) {
+          if (requests.size === 0) inFlightDiffFetchesByDirectory.delete(key);
+        }
         diffFetchGenerationByDirectory.clear();
         set({
           runtimeKey,
@@ -1141,7 +1149,6 @@ export const useGitStore = create<GitStore>()(
       },
 
       prefetchDiffs: async (directory, git, filePaths, options = {}) => {
-        const token = startRequest(directory, 'diff');
         const dirState = get().directories.get(directory);
         if (!dirState?.status?.files || dirState.status.files.length === 0 || filePaths.length === 0) return;
 
@@ -1175,7 +1182,7 @@ export const useGitStore = create<GitStore>()(
         }
 
         const limitedFilePaths = dedupedPaths.slice(0, Math.max(1, maxFiles));
-        if (limitedFilePaths.length === 0) return;
+        if (limitedFilePaths.length === 0 || inFlight.size >= DIFF_PREFETCH_CONCURRENCY) return;
 
         const generation = getDiffFetchGeneration(directory);
 
@@ -1183,10 +1190,10 @@ export const useGitStore = create<GitStore>()(
           return;
         }
 
-        limitedFilePaths.forEach((path) => inFlight.add(path));
+        const token = startRequest(directory, 'diff');
 
         let nextIndex = 0;
-        const results: Array<{ path: string; diff: { original: string; modified: string; isBinary?: boolean } }> = [];
+        const results: Array<{ path: string; diff: CachedGitDiff }> = [];
 
         const takeNext = () => {
           const current = nextIndex;
@@ -1195,38 +1202,50 @@ export const useGitStore = create<GitStore>()(
         };
 
         const fetchWithTimeout = async (filePath: string) => {
-          const fetchPromise = git.getGitFileDiff(directory, { path: filePath });
+          inFlight.add(filePath);
+          const fetchPromise = (async () => {
+            try {
+              return await git.getGitFileDiff(directory, { path: filePath });
+            } finally {
+              // A UI deadline only stops waiting. Keep the path and capacity
+              // reserved until the transport actually settles.
+              inFlight.delete(filePath);
+            }
+          })();
+          let timeout: ReturnType<typeof setTimeout> | undefined;
           const timeoutPromise = new Promise<never>((_, reject) => {
-            setTimeout(() => reject(new Error(`Timed out after ${DIFF_PREFETCH_TIMEOUT_MS}ms`)), DIFF_PREFETCH_TIMEOUT_MS);
+            timeout = setTimeout(() => reject(new Error(`Timed out after ${DIFF_PREFETCH_TIMEOUT_MS}ms`)), DIFF_PREFETCH_TIMEOUT_MS);
           });
-          const response = await Promise.race([fetchPromise, timeoutPromise]);
-          return {
-            path: filePath,
-            diff: { original: response.original ?? '', modified: response.modified ?? '', isBinary: response.isBinary },
-          };
+          try {
+            const response = await Promise.race([fetchPromise, timeoutPromise]);
+            return {
+              path: filePath,
+              diff: { original: response.original ?? '', modified: response.modified ?? '', isBinary: response.isBinary, submodule: response.submodule },
+            };
+          } finally {
+            clearTimeout(timeout);
+          }
         };
 
         const worker = async () => {
           for (;;) {
-            if (generation !== getDiffFetchGeneration(directory) || !isRequestCurrent(token, directory)) {
+            if (generation !== getDiffFetchGeneration(directory) || !isRequestCurrent(token, directory)
+              || inFlight.size >= DIFF_PREFETCH_CONCURRENCY) {
               return;
             }
             const next = takeNext();
             if (!next) return;
+            if (inFlight.has(next)) continue;
             try {
               results.push(await fetchWithTimeout(next));
             } catch {
               // Ignore individual failures/timeouts during prefetch.
-            } finally {
-              inFlight.delete(next);
             }
           }
         };
 
         const workerCount = Math.min(DIFF_PREFETCH_CONCURRENCY, limitedFilePaths.length);
         await Promise.allSettled(Array.from({ length: workerCount }, () => worker()));
-
-        limitedFilePaths.forEach((path) => inFlight.delete(path));
 
         if (generation !== getDiffFetchGeneration(directory) || !isRequestCurrent(token, directory)) {
           return;
