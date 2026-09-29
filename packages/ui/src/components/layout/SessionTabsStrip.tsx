@@ -1,4 +1,5 @@
 import React from 'react';
+import { useSessionTurnActive } from '@/sync/global-session-status';
 import { SessionActivityIndicator } from '@/components/session/SessionActivityIndicator';
 import {
   DndContext,
@@ -34,9 +35,9 @@ import { useSessionTabsStore } from '@/stores/useSessionTabsStore';
 import { closeSessionTabAndActivateNeighbour } from '@/lib/sessionTabs';
 import { useGlobalSessionsStore, resolveGlobalSessionDirectory } from '@/stores/useGlobalSessionsStore';
 import { useSessionUIStore } from '@/sync/session-ui-store';
-import { useGlobalSessionStatus } from '@/sync/sync-context';
 import { useSessionUnseenCount } from '@/sync/notification-store';
 import { useIsSessionAiRenamePending } from '@/sync/use-session-ai-rename';
+import { useMultiRunMemberIds } from '@/lib/multirun/useMultiRuns';
 
 const restrictToXAxis: Modifier = ({ transform }) => ({ ...transform, y: 0 });
 
@@ -108,9 +109,8 @@ const SessionTabItem: React.FC<{
   const overlayVisible = !suppressControls && (menuOpen || menuVisible);
 
   // Session state for the dot and the hover tooltip.
-  const sessionStatus = useGlobalSessionStatus(tab.id);
   const isAiRenaming = useIsSessionAiRenamePending(tab.id, resolveGlobalSessionDirectory(tab.session));
-  const isStreaming = sessionStatus?.type === 'busy' || sessionStatus?.type === 'retry';
+  const isStreaming = useSessionTurnActive(tab.id);
   const unseenCount = useSessionUnseenCount(tab.id);
   const showUnread = unseenCount > 0 && !isActive && !isStreaming;
   const showDot = isStreaming || showUnread;
@@ -302,10 +302,12 @@ export const SessionTabsStrip: React.FC<{
   const setCurrentSession = useSessionUIStore((state) => state.setCurrentSession);
   const activeSessions = useGlobalSessionsStore((state) => state.activeSessions);
 
-  // Opening a session anywhere (sidebar, palette, deep link) adds its tab.
+  // Opening a session anywhere (sidebar, palette, deep link) adds its tab. The
+  // lanes of one multi-run share a tab: opening another lane reuses it.
+  const currentRunMemberIds = useMultiRunMemberIds(currentSessionId);
   React.useEffect(() => {
-    if (currentSessionId) ensureTab(currentSessionId);
-  }, [currentSessionId, ensureTab]);
+    if (currentSessionId) ensureTab(currentSessionId, currentRunMemberIds);
+  }, [currentSessionId, currentRunMemberIds, ensureTab]);
 
   const sessionsById = React.useMemo(() => {
     const map = new Map<string, Session>();

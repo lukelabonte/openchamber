@@ -703,7 +703,7 @@ export const ProjectActionsButton = ({
             useTerminalStore.getState().setTabPurpose(tabDirectory, tab.id, { type: 'project-action', actionId, executionId: null });
             clearExecutionUi(tabDirectory, actionId, currentExecutionId);
           },
-        });
+        }, tabDirectory);
         streamCleanupByRunKeyRef.current[streamKey] = subscription.close;
       }
     }
@@ -920,6 +920,7 @@ export const ProjectActionsButton = ({
               clearExecutionUi(executionDirectory, discovered.id, adoptedExecutionId);
             }
           } },
+          executionDirectory,
         );
       if (!matchesActionExecution(executionDirectory, tabId, adoptedExecutionId)) {
         subscription.close();

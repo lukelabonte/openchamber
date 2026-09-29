@@ -33,8 +33,10 @@ proceeds asynchronously, so shell startup files run while the window comes up.
 Startup callers share one probe and await its result before reading
 shell-provided server flags or importing the backend. The probe tries
 interactive login, then login-only on failure, with a five-second timeout per
-attempt. Failure preserves the inherited process environment. Confirmed quit
-cancels an in-flight probe and waits for its process to exit.
+attempt. Text that shell startup files print to stdout before the environment
+is discarded, so a banner never fuses with the first variable. Failure
+preserves the inherited process environment. Confirmed quit cancels an
+in-flight probe and waits for its process to exit.
 
 `bun run profile:startup` measures a packaged build's launch in an isolated
 profile; see `scripts/perf/DOCUMENTATION.md`.
@@ -57,6 +59,16 @@ for the launch paths, controlled reproductions, and Windows validation limits.
 Same-origin session-chat iframes complete an authenticated parent-frame handshake before creating their SDK client. The parent supplies its active in-memory endpoint and credentials; when relay is active it also supplies the public relay descriptor without any pairing grant, because Electron preload and IPC are unavailable inside the iframe. The iframe establishes its own transport and rebinds its SDK before rendering. Additional windows retain their own per-window runtime bootstrap instead of being overwritten by the main window. Credentials are never placed in iframe URLs, and other child pages do not receive this runtime state.
 
 The preload bridge exposes desktop-only APIs to the web UI through `window.__OPENCHAMBER_DESKTOP__`. Privileged commands are checked in `main.mjs`, not only in the UI.
+
+The compatibility gate can reuse the embedded managed OpenCode CLI preflight
+through `desktop_managed_opencode_compatible`. Main matches the requested
+API origin to the local backend and reads the lifecycle-owned preflight promise.
+A pending check is shared; successful checks allow UI initialization before
+server health becomes ready. Restart invalidates the result. This avoids a second
+CLI version process during startup.
+External OpenCode, remote instances, HMR backends without an embedded handle,
+and unavailable IPC retain the HTTP compatibility check. The renderer discards
+IPC results if its endpoint changes while the read is pending.
 
 ## Main Files
 

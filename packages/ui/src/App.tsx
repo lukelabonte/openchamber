@@ -1,3 +1,4 @@
+import { OpenCodeCompatibilityGate } from '@/components/update/OpenCodeCompatibilityGate';
 import React from 'react';
 import { AppStartupOverlay } from '@/components/ui/AppStartupOverlay';
 import { MainLayout } from '@/components/layout/MainLayout';
@@ -21,6 +22,7 @@ import { usePushVisibilityBeacon } from '@/hooks/usePushVisibilityBeacon';
 import { useWebNotificationStream } from '@/hooks/useWebNotificationStream';
 import { useAgentMemorySync } from '@/hooks/useAgentMemorySync';
 import { useBrowserProviderSync } from '@/hooks/useBrowserProviderSync';
+import { useEnterprisePolicySync } from '@/hooks/useEnterprisePolicySync';
 import { useRoutingSync } from '@/hooks/useRoutingSync';
 import { usePwaInstallPrompt } from '@/hooks/usePwaInstallPrompt';
 import { useWindowTitle } from '@/hooks/useWindowTitle';
@@ -69,8 +71,9 @@ import { SyncAppEffects } from '@/apps/AppEffects';
 import { resetAppForRuntimeEndpointChange } from '@/apps/runtimeEndpointReset';
 import { useAppFontEffects } from '@/apps/useAppFontEffects';
 import { OpenCodeUpdateToast } from '@/components/update/OpenCodeUpdateToast';
+import { ProjectConfigErrorToast } from '@/components/projects/ProjectConfigErrorToast';
 import { markStartupTrace, startupTraceEnabled } from '@/lib/startupTrace';
-import { fetchStartupDiagnostics, type StartupDiagnostics } from '@/lib/startupDiagnostics';
+import { fetchStartupDiagnostics, getInitRecoveryDescriptionKey, type StartupDiagnostics } from '@/lib/startupDiagnostics';
 
 // Lazy-loaded heavy views — loaded on demand to reduce initial bundle size.
 const OnboardingScreen = lazyWithChunkRecovery(() =>
@@ -112,13 +115,23 @@ const StartupInitializationRecovery: React.FC<{
     };
   }, []);
 
+  const failure = useConfigStore((s) => s.lastInitFailure);
+  // Server diagnostics outrank the client's guess: they prove the server answered.
+  const failureMessage = diagnostics ? null : failure?.message ?? null;
+
   return (
     <div className="flex h-full flex-col items-center overflow-y-auto bg-background px-6 py-6 text-foreground">
       <div className="my-auto flex w-full max-w-xl shrink-0 flex-col items-center gap-4 text-center">
         <div className="flex flex-col gap-2">
           <h1 className="typography-title text-foreground">{t('startup.initRecovery.title')}</h1>
-          <p className="typography-body text-muted-foreground">{t(diagnostics ? 'startup.initRecovery.openCodeUnavailable' : 'startup.initRecovery.description')}</p>
+          <p className="typography-body text-muted-foreground">{t(getInitRecoveryDescriptionKey(diagnostics, failure))}</p>
         </div>
+        {failureMessage && (
+          <dl className="w-full min-w-0 text-left" aria-live="polite">
+            <dt className="typography-meta text-muted-foreground">{t('startup.initRecovery.lastError')}</dt>
+            <dd className="max-h-56 overflow-y-auto whitespace-pre-wrap break-words rounded-md bg-[var(--surface-muted)] px-3 py-2 font-mono typography-meta text-muted-foreground">{failureMessage}</dd>
+          </dl>
+        )}
         {diagnostics && (
           <dl className="w-full min-w-0 space-y-3 text-left" aria-live="polite">
             {diagnostics.binary && (
@@ -747,6 +760,7 @@ function App({ apis }: AppProps) {
   useAgentMemorySync(currentDirectory || null);
   useBrowserProviderSync();
   useRoutingSync();
+  useEnterprisePolicySync();
   usePwaInstallPrompt();
 
   useWindowTitle();
@@ -973,6 +987,7 @@ function App({ apis }: AppProps) {
                 <div className={isDesktopRuntime ? 'h-full text-foreground bg-transparent' : 'h-full text-foreground bg-background'}>
                   <SyncAppEffects embeddedBackgroundWorkEnabled={embeddedBackgroundWorkEnabled} />
                   <OpenCodeUpdateToast />
+                  <ProjectConfigErrorToast />
                   <MainLayout />
                   <AppStartupOverlay ready={isInitialized && (!isDesktopRuntime || (bootOutcomeKnown && bootViewIsMain))} />
                   <Toaster />
@@ -996,4 +1011,6 @@ function App({ apis }: AppProps) {
   );
 }
 
-export default App;
+export default function CompatibleApp(props: AppProps) {
+  return <OpenCodeCompatibilityGate><App {...props} /></OpenCodeCompatibilityGate>;
+}
